@@ -1,0 +1,111 @@
+name: Update Package
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: The package name to update
+        required: true
+        type: string
+      force-open-pr:
+        description: Force opening a PR, regardless if already a PR is existing for that package
+        type: boolean
+        required: false
+        default: false
+      open-pr:
+        description: Automatically open a PR on nixpkgs. A PR won't be created if a PR for this package already exists
+        required: false
+        type: boolean
+        default: true
+      nixpkgs-review-gha-fork:
+        description: The nixpkgs-review-gha fork used to run nixpkgs-review
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check if PR exists
+        id: find-prs
+        if: ${{ inputs.open-pr != 'force' }}
+        run: |
+          # Query open PRs and filter with jq+regex on the title.
+          matches=$(gh pr list --state open --json number,title \
+            | jq -c --arg re "${{ inputs.package }}:" 'map(select(.title | test($re; "i")))')
+
+          count=$(jq 'length' <<<"$matches")
+          if [ "$count" -gt 0 ]; then
+            numbers=$(jq -r 'map(.number)|join(",")' <<<"$matches")
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Clone nixpkgs
+        uses: actions/checkout@v4
+        with:
+          repository: NixOS/nixpkgs
+          persist-credentials: false
+
+      - name: Get the current version
+        id: current-version
+        run: |
+            # Get new revision
+            current_version=$(nix eval .#${{ inputs.package }}.version --raw 2>/dev/null || echo "unknown")
+            echo "Current version: ${{ inputs.package }}-$current_version"
+            echo "version=$current_version" >> "$GITHUB_OUTPUT"
+
+      - name: Run Update Script
+        run: |
+            if output=$(nix develop -f maintainers/scripts/update.nix --argstr package ${{ inputs.package }} ); then
+              echo "$output"
+            else
+              echo "::error::update failed for package ${{ inputs.package }}"
+              echo "$output"
+              exit 1
+            fi
+
+      - name: Detect changes
+        id: changes
+        run: |
+            # Check if there were actual changes
+            if git diff --quiet; then
+              echo "::notice::no changes detected for package ${{ inputs.package }}"
+              exit 1
+            fi
+
+      - name: Get the new version
+        id: new-version
+        run: |
+            # Get new revision
+            new_version=$(nix flake metadata --json --no-write-lock-file | jq -r ".locks.nodes.\"$name\".locked.rev // \"unknown\"" | head -c 8)
+            echo "New version: ${{ inputs.package }}-$new_version"
+            echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+      - name: Create PR
+        id: create-pr
+        if: ${{ inputs.foce-open-pr || steps.find-prs.found == false && inputs.open-pr }}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          commit-message: "${{ inputs.package }}: ${{ current-version.version }} -> ${{ new-version.version }}"
+          branch: update-${{ inputs.package }}
+          delete-branch: true
+          branch-suffix: short-commit-hash
+          title: "${{ inputs.package }}: ${{ current-version.version }} -> ${{ new-version.version }}"
+
+      - name: Trigger nixpkgs-review-gha
+        if: ${{ inputs.nixpkgs-review-gha-fork != '' && steps.create-pr.pull-request-number }}
+        run: |
+          if [[ -n "$GH_TOKEN" ]]; then
+            gh workflow run review.yml -R ${{ inputs.nixpkgs-review-gha-fork }} -f pr=${{ steps.create-pr.pull-request-number }}
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}

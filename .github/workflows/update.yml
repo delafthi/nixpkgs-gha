@@ -1,0 +1,34 @@
+name: Update the packages I maintain
+on:
+  schedule:
+    # Run monday and friday at 2 AM UTC
+    - cron: '0 2 * * 1,5'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: The package name to update
+        required: true
+        type: string
+      force-open-pr:
+        description: Force opening a PR, regardless if already a PR is existing for that package
+        type: boolean
+        required: false
+        default: false
+      open-pr:
+        description: Automatically open a PR on nixpkgs. A PR won't be created if a PR for this package already exists
+        required: false
+        type: boolean
+        default: true
+      nixpkgs-review-gha-fork:
+        description: The nixpkgs-review-gha fork used to run nixpkgs-review
+        required: false
+        type: string
+        default: ''
+jobs:
+  update:
+    uses: ./.github/workflows/update-package.yml
+    with:
+      package: ${{ inputs.package }}
+      force-open-pr: ${{ inputs.force-open-pr }}
+      open-pr: ${{ inputs.open-pr }}
+      nixpkgs-review-gha-fork: ${{ inputs.nixpkgs-review-gha-fork }}
