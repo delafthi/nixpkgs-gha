@@ -1,0 +1,283 @@
+name: Update Package
+on:
+  workflow_call:
+    inputs:
+      update-info:
+        description: Update info string in format "package oldVersion newVersion" or just "package" (e.g., "tflint 0.15.0 0.15.1" or "tflint")
+        required: true
+        type: string
+      nixpkgs-repo:
+        description: The nixpkgs repository to target
+        required: false
+        type: string
+        default: NixOS/nixpkgs
+      nixpkgs-fork:
+        description: Your fork of nixpkgs to push changes to
+        required: true
+        type: string
+      skip-if-pr-exists:
+        description: Skip update if an open PR already exists for this package
+        type: boolean
+        required: false
+        default: true
+      nixpkgs-review:
+        description: Run nixpkgs-review on the update
+        required: false
+        type: boolean
+        default: true
+      nixpkgs-review-gha-repo:
+        description: Your fork of nixpkgs-review-gha to trigger external review (e.g., "yourname/nixpkgs-review-gha")
+        required: false
+        type: string
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Parse update info
+        id: parse
+        run: |
+          # Extract package name and optional version from update-info
+          update_info="${{ inputs.update-info }}"
+          package=$(echo "$update_info" | awk '{print $1}')
+          word_count=$(echo "$update_info" | wc -w)
+
+          # Check if explicit version provided (2 or 3 words: "pkg version" or "pkg oldVer newVer")
+          if [ "$word_count" -eq 2 ]; then
+            # Format: "package newVersion"
+            new_version=$(echo "$update_info" | awk '{print $2}')
+            echo "new-version=$new_version" >> "$GITHUB_OUTPUT"
+            echo "explicit-version=true" >> "$GITHUB_OUTPUT"
+          elif [ "$word_count" -eq 3 ]; then
+            # Format: "package oldVersion newVersion" - we only need newVersion
+            new_version=$(echo "$update_info" | awk '{print $3}')
+            echo "new-version=$new_version" >> "$GITHUB_OUTPUT"
+            echo "explicit-version=true" >> "$GITHUB_OUTPUT"
+          else
+            # Auto-discover version
+            echo "explicit-version=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "::notice::Updating package: $package"
+
+      - name: Check if PR exists
+        id: find-prs
+        if: ${{ inputs.skip-if-pr-exists }}
+        run: |
+          # Query open PRs for this package
+          matches=$(gh pr list --repo ${{ inputs.nixpkgs-repo }} --state open --json number,title \
+            | jq -c --arg pkg "${{ steps.parse.outputs.package }}" 'map(select(.title | test("^" + $pkg + ":"; "i")))')
+
+          count=$(jq 'length' <<<"$matches")
+          [ "$count" -gt 0 ] && {
+            numbers=$(jq -r 'map(.number)|join(", ")' <<<"$matches")
+            echo "::warning::Skipping ${{ steps.parse.outputs.package }} - existing PR(s): #$numbers"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          } || echo "found=false" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Checkout nixpkgs
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.nixpkgs-repo }}
+
+      - name: Install Nix
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup magic-nix-cache
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Setup git identity
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get current version
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.parse.outputs.explicit-version != 'true' }}
+        id: current-version
+        run: |
+          old_version=$(nix eval --raw .#${{ steps.parse.outputs.package }}.version 2>/dev/null || {
+            echo "::error::Package ${{ steps.parse.outputs.package }} not found"
+            exit 1
+          })
+          echo "old-version=$old_version" >> "$GITHUB_OUTPUT"
+          echo "::notice::Current version: $old_version"
+
+      - name: Run nix-update
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: nix-update
+        run: |
+          # Build nix-update command
+          cmd="nix run nixpkgs#nix-update -- ${{ steps.parse.outputs.package }}"
+
+          # Add version flag if explicit version provided
+          if [ "${{ steps.parse.outputs.explicit-version }}" == "true" ]; then
+            cmd="$cmd --version=${{ steps.parse.outputs.new-version }}"
+          fi
+
+          # Run nix-update
+          eval "$cmd" && {
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::nix-update completed successfully"
+          } || {
+            exit_code=$?
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            echo "::error::nix-update failed with exit code $exit_code"
+            exit 1
+          }
+
+      - name: Get updated version
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' }}
+        id: new-version
+        run: |
+          new_version=$(nix eval --raw .#${{ steps.parse.outputs.package }}.version 2>/dev/null || echo "unknown")
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "::notice::New version: $new_version"
+
+      - name: Get package metadata
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' }}
+        id: metadata
+        run: |
+          # Get package metadata for PR body
+          description=$(nix eval --raw .#${{ steps.parse.outputs.package }}.meta.description 2>/dev/null || echo "")
+          homepage=$(nix eval --raw .#${{ steps.parse.outputs.package }}.meta.homepage 2>/dev/null || echo "")
+          changelog=$(nix eval --raw .#${{ steps.parse.outputs.package }}.meta.changelog 2>/dev/null || echo "")
+
+          # Create PR body
+          body="Automatic update generated by [nixpkgs-update-gha](https://github.com/delafthi/nixpkgs-update-gha)."
+
+          [ -n "$description" ] && body="$body
+
+          **Description:** $description"
+
+          [ -n "$homepage" ] && body="$body
+
+          **Homepage:** $homepage"
+
+          [ -n "$changelog" ] && body="$body
+
+          **Changelog:** $changelog"
+
+          # Save to output (use delimiter to handle multiline)
+          {
+            echo "body<<EOF"
+            echo "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run nixpkgs-review
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' && inputs.nixpkgs-review }}
+        id: nixpkgs-review
+        continue-on-error: true
+        run: |
+          # Get the current commit
+          commit=$(git rev-parse HEAD)
+
+          # Run nixpkgs-review
+          nix run nixpkgs#nixpkgs-review -- rev "$commit" --no-shell 2>&1 | tee review.log || true
+
+          # Extract summary from review
+          if [ -f review.log ]; then
+            review_summary=$(cat review.log | tail -n 20)
+            {
+              echo "summary<<EOF"
+              echo "\`\`\`"
+              echo "$review_summary"
+              echo "\`\`\`"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Append nixpkgs-review to PR body
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' && inputs.nixpkgs-review && steps.nixpkgs-review.outputs.summary != '' }}
+        id: final-body
+        run: |
+          {
+            echo "body<<EOF"
+            echo "${{ steps.metadata.outputs.body }}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "### nixpkgs-review"
+            echo ""
+            echo "${{ steps.nixpkgs-review.outputs.summary }}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set PR body
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' }}
+        id: pr-body
+        run: |
+          # Use final body if nixpkgs-review ran, otherwise use metadata body
+          if [ -n "${{ steps.final-body.outputs.body }}" ]; then
+            {
+              echo "body<<EOF"
+              echo "${{ steps.final-body.outputs.body }}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<EOF"
+              echo "${{ steps.metadata.outputs.body }}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine old version for PR title
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' }}
+        id: old-version
+        run: |
+          # Use explicit old version if provided, otherwise use current version from earlier step
+          if [ "${{ steps.parse.outputs.explicit-version }}" == "true" ]; then
+            # Extract old version from update-info if it was "pkg oldVer newVer" format
+            update_info="${{ inputs.update-info }}"
+            word_count=$(echo "$update_info" | wc -w)
+            if [ "$word_count" -eq 3 ]; then
+              old_ver=$(echo "$update_info" | awk '{print $2}')
+            else
+              # If only "pkg newVer" format, try to get it from git history
+              old_ver=$(git log --all --format=%B --grep="^${{ steps.parse.outputs.package }}:" | head -n1 | sed -E "s/${{ steps.parse.outputs.package }}: (.*) → .*/\1/" || echo "unknown")
+            fi
+          else
+            old_ver="${{ steps.current-version.outputs.old-version }}"
+          fi
+          echo "version=$old_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Create Pull Request
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' }}
+        id: create-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          push-to-fork: ${{ inputs.nixpkgs-fork }}
+          branch: auto-update/${{ steps.parse.outputs.package }}
+          delete-branch: true
+          title: "${{ steps.parse.outputs.package }}: ${{ steps.old-version.outputs.version }} → ${{ steps.new-version.outputs.version }}"
+          body: ${{ steps.pr-body.outputs.body }}
+          commit-message: "${{ steps.parse.outputs.package }}: ${{ steps.old-version.outputs.version }} → ${{ steps.new-version.outputs.version }}"
+
+      - name: Trigger nixpkgs-review-gha
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.nix-update.outputs.success == 'true' && steps.create-pr.outputs.pull-request-number != '' && inputs.nixpkgs-review-gha-repo != '' }}
+        run: |
+          # Trigger the review workflow in the nixpkgs-review-gha fork
+          gh workflow run review.yml \
+            --repo ${{ inputs.nixpkgs-review-gha-repo }} \
+            --field pr=${{ steps.create-pr.outputs.pull-request-number }}
+
+          echo "::notice::Triggered nixpkgs-review-gha workflow for PR #${{ steps.create-pr.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
