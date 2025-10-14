@@ -1,0 +1,98 @@
+name: Update the packages I maintain
+on:
+  schedule:
+    # Run monday and friday at 2 AM UTC
+    - cron: "0 2 * * 1,5"
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Space-separated list of package names to update (e.g., "hello nix-update")
+        required: false
+        type: string
+      force-open-pr:
+        description: Force opening a PR, regardless if already a PR is existing for that package
+        type: boolean
+        required: false
+        default: false
+      open-pr:
+        description: Automatically open a PR on nixpkgs. A PR won't be created if a PR for this package already exists
+        required: false
+        type: boolean
+        default: true
+      nixpkgs-review-gha-fork:
+        description: The nixpkgs-review-gha fork used to run nixpkgs-review
+        required: false
+        type: string
+        default: ""
+      nixpkgs-repo:
+        description: The nixpkgs repository to target (for testing, use your fork)
+        required: false
+        type: string
+        default: NixOS/nixpkgs
+
+env:
+  WATCHING_PACKAGES: ${{ vars.WATCHING_PACKAGES || '' }}
+  FORCE_OPEN_PR: ${{ vars.FORCE_OPEN_PR || 'false' }}
+  OPEN_PR: ${{ vars.OPEN_PR || 'true' }}
+  NIXPKGS_REVIEW_GHA_FORK: ${{ vars.NIXPKGS_REVIEW_GHA_FORK || '' }}
+  NIXPKGS_REPO: ${{ vars.NIXPKGS_REPO || 'NixOS/nixpkgs' }}
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      packages: ${{ steps.parse-packages.outputs.packages }}
+      force-open-pr: ${{ steps.parse-packages.outputs.force-open-pr }}
+      open-pr: ${{ steps.parse-packages.outputs.open-pr }}
+      nixpkgs-review-gha-fork: ${{ steps.parse-packages.outputs.nixpkgs-review-gha-fork }}
+      nixpkgs-repo: ${{ steps.parse-packages.outputs.nixpkgs-repo }}
+    steps:
+      - name: Parse configuration
+        id: parse-packages
+        run: |
+          # Parse package list
+          if [ -n "${{ inputs.packages }}" ]; then
+            packages="${{ inputs.packages }}"
+          else
+            packages="${WATCHING_PACKAGES}"
+          fi
+
+          json_array=$(echo "$packages" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "packages=$json_array" >> "$GITHUB_OUTPUT"
+          echo "::notice::Will update packages: $json_array"
+
+          # Parse other inputs (workflow_dispatch overrides variables)
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            force_open_pr="${{ inputs.force-open-pr }}"
+            open_pr="${{ inputs.open-pr }}"
+            nixpkgs_review_gha_fork="${{ inputs.nixpkgs-review-gha-fork }}"
+            nixpkgs_repo="${{ inputs.nixpkgs-repo }}"
+          else
+            force_open_pr="${FORCE_OPEN_PR}"
+            open_pr="${OPEN_PR}"
+            nixpkgs_review_gha_fork="${NIXPKGS_REVIEW_GHA_FORK}"
+            nixpkgs_repo="${NIXPKGS_REPO}"
+          fi
+
+          echo "force-open-pr=${force_open_pr}" >> "$GITHUB_OUTPUT"
+          echo "open-pr=${open_pr}" >> "$GITHUB_OUTPUT"
+          echo "nixpkgs-review-gha-fork=${nixpkgs_review_gha_fork}" >> "$GITHUB_OUTPUT"
+          echo "nixpkgs-repo=${nixpkgs_repo}" >> "$GITHUB_OUTPUT"
+
+  update:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.prepare-matrix.outputs.packages) }}
+    uses: ./.github/workflows/update-package.yml
+    with:
+      package: ${{ matrix.package }}
+      force-open-pr: ${{ fromJson(needs.prepare-matrix.outputs.force-open-pr) }}
+      open-pr: ${{ fromJson(needs.prepare-matrix.outputs.open-pr) }}
+      nixpkgs-review-gha-fork: ${{ needs.prepare-matrix.outputs.nixpkgs-review-gha-fork }}
+      nixpkgs-repo: ${{ needs.prepare-matrix.outputs.nixpkgs-repo }}
+    secrets: inherit
