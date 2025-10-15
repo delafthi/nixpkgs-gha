@@ -49,7 +49,7 @@ jobs:
         uses: cachix/install-nix-action@v31
 
       - name: Clone nixpkgs
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: NixOS/nixpkgs
           persist-credentials: false
