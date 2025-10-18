@@ -1,0 +1,117 @@
+name: Auto Merge PR
+
+on:
+  pull_request_target:
+    types: [labeled, unlabeled]
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to merge"
+        required: true
+        type: string
+      merge_method:
+        description: "Merge method"
+        default: "merge"
+        type: choice
+        options: [merge, squash, rebase]
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: auto-merge-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+      MERGE_METHOD: ${{ github.event.inputs.merge_method || 'merge' }}
+
+    steps:
+      - name: Remove auto-merge if unlabeled
+        if: github.event.action == 'unlabeled' && github.event.label.name == 'auto-merge'
+        run: gh pr merge --disable-auto "${PR_NUMBER}" --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate PR source
+        if: github.event_name == 'pull_request_target'
+        run: |
+          if [[ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+            echo "::notice::PR from fork detected. Auto-merge only allowed from same repository for security."
+            exit 1
+          fi
+
+      - name: Check auto-merge label
+        id: check-label
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_merge=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'auto-merge') }}" == "true" ]]; then # editorconfig-checker-disable-line
+            echo "should_merge=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify PR checks
+        if: steps.check-label.outputs.should_merge == 'true'
+        run: |
+          echo "::notice::Verifying PR #${PR_NUMBER} status..."
+
+          PR_DATA=$(gh pr view "${PR_NUMBER}" --repo "${{ github.repository }}" --json state,statusCheckRollup)
+          PR_STATE=$(echo "${PR_DATA}" | jq -r '.state')
+
+          if [[ "${PR_STATE}" != "OPEN" ]]; then
+            echo "::error::PR is not open (state: ${PR_STATE})"
+            exit 1
+          fi
+
+          # Check if all required status checks have passed
+          FAILED_CHECKS=$(echo "${PR_DATA}" | jq -r '[.statusCheckRollup[]? | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED")] | length')
+          PENDING_CHECKS=$(echo "${PR_DATA}" | jq -r '[.statusCheckRollup[]? | select(.status == "IN_PROGRESS" or .status == "QUEUED" or .status == "PENDING")] | length')
+
+          if [[ "${FAILED_CHECKS}" -gt 0 ]]; then
+            echo "::error::PR has ${FAILED_CHECKS} failed check(s)"
+            exit 1
+          fi
+
+          if [[ "${PENDING_CHECKS}" -gt 0 ]]; then
+            echo "::notice::PR has ${PENDING_CHECKS} pending check(s), will wait for completion"
+          fi
+
+          echo "::notice::PR is open and checks are passing"
+          {
+            echo "## Auto-merge Status"
+            echo "- PR #${PR_NUMBER} is ready to merge"
+            echo "- Merge method: ${MERGE_METHOD}"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-merge PR
+        if: steps.check-label.outputs.should_merge == 'true'
+        run: |
+          echo "::notice::Merging PR #${PR_NUMBER} using ${MERGE_METHOD}"
+
+          if gh pr merge "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --"${MERGE_METHOD}" \
+            --auto \
+            --delete-branch; then
+            echo "::notice::PR #${PR_NUMBER} merged successfully"
+          else
+            echo "::error::Failed to merge PR #${PR_NUMBER}"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip merge
+        if: steps.check-label.outputs.should_merge == 'false'
+        run: echo "::notice::PR does not have auto-merge label, skipping"
