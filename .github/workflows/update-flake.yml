@@ -1,0 +1,37 @@
+name: Update flake
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0" # Every Sunday at 02:00
+
+env:
+  NIXPKGS_BRANCH: nixpkgs-unstable
+
+jobs:
+  update-flake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          nix_path: nixpkgs=channel:${{ env.NIXPKGS_BRANCH }}
+
+      - name: Update flake
+        uses: DeterminateSystems/update-flake-lock@v27
+        with:
+          commit-msg: "chore: update flake"
+          pr-title: "chore: update flake"
+          pr-labels: |
+            auto-merge
+            dependencies
+          token: ${{ secrets.GH_TOKEN }} # For auto-merge workflow trigger
