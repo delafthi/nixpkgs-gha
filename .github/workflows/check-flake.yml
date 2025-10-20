@@ -30,7 +30,7 @@ jobs:
           nix_path: nixpkgs=channel:${{ env.NIXPKGS_BRANCH }}
 
       - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
+        uses: DeterminateSystems/magic-nix-cache-action@v13
 
       - name: Check formatting
         run: nix build .#checks.x86_64-linux.treefmt
