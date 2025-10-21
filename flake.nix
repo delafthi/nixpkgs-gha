@@ -2,11 +2,9 @@
   description = "GitHub Automations for the nixpkgs I maintain";
 
   inputs = {
-    # keep-sorted start
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     treefmt-nix.url = "github:numtide/treefmt-nix";
-    # keep-sorted end
   };
 
   outputs =

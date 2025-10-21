@@ -1,0 +1,520 @@
+name: Update packages
+on:
+  schedule:
+    - cron: "0 3 * * 2,5"
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Packages to update (space-separated). Format: "foo bar baz".  Defaults to PACKAGES var.'
+        required: false
+        type: string
+      nixpkgs-review-gha:
+        description: "Trigger external nixpkgs-review-gha workflow"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: update-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PACKAGES: ${{ vars.PACKAGES || '' }}
+  NIXPKGS_REPO: ${{ vars.NIXPKGS_REPO || '' }}
+  NIXPKGS_FORK: ${{ vars.NIXPKGS_FORK || '' }}
+  NIXPKGS_REVIEW_GHA: ${{ vars.NIXPKGS_REVIEW_GHA || 'false' }}
+  NIXPKGS_REVIEW_GHA_REPO: ${{ vars.NIXPKGS_REVIEW_GHA_REPO || '' }}
+
+jobs:
+  parse-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    outputs:
+      packages: ${{ steps.parse-inputs.outputs.packages }}
+      nixpkgs-repo: ${{ steps.parse-inputs.outputs.nixpkgs-repo }}
+      nixpkgs-fork: ${{ steps.parse-inputs.outputs.nixpkgs-fork }}
+      nixpkgs-review-gha: ${{ steps.parse-inputs.outputs.nixpkgs-review-gha }}
+      nixpkgs-review-gha-repo: ${{ steps.parse-inputs.outputs.nixpkgs-review-gha-repo }}
+
+    steps:
+      - name: Parse and validate inputs
+        id: parse-inputs
+        run: |
+          if [ -z "${{ secrets.GH_TOKEN }}" ]; then
+            echo "::error::GH_TOKEN secret is required but not set"
+            exit 1
+          fi
+
+          if [ -z "${{ env.NIXPKGS_REPO }}" ]; then
+            echo "::error::NIXPKGS_REPO variable is required but not set"
+            exit 1
+          fi
+          if ! echo "${{ env.NIXPKGS_REPO }}" | grep -qE '^[a-zA-Z0-9_-]+/[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid NIXPKGS_REPO format. Expected: owner/repo, got: ${{ env.NIXPKGS_REPO }}"
+            exit 1
+          fi
+
+          if [ -z "${{ env.NIXPKGS_FORK }}" ]; then
+            echo "::error::NIXPKGS_FORK variable is required but not set"
+            exit 1
+          fi
+          if ! echo "${{ env.NIXPKGS_FORK }}" | grep -qE '^[a-zA-Z0-9_-]+/[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid NIXPKGS_FORK format. Expected: owner/repo, got: ${{ env.NIXPKGS_FORK }}"
+            exit 1
+          fi
+
+          packages="${{ inputs.packages || env.PACKAGES }}"
+          if [ -z "$packages" ]; then
+            echo "::error::No packages specified"
+            exit 1
+          fi
+
+          for pkg in $packages; do
+            if ! echo "$pkg" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+              echo "::error::Invalid package name: $pkg"
+              exit 1
+            fi
+          done
+
+          review_gha="${{ inputs.nixpkgs-review-gha || env.NIXPKGS_REVIEW_GHA }}"
+          [ "$review_gha" = "true" ] && review_gha="true" || review_gha="false"
+
+          if [ "$review_gha" = "true" ]; then
+            if [ -z "${{ env.NIXPKGS_REVIEW_GHA_REPO }}" ]; then
+              echo "::warning::NIXPKGS_REVIEW_GHA is enabled but NIXPKGS_REVIEW_GHA_REPO is not set"
+              review_gha="false"
+            elif ! echo "${{ env.NIXPKGS_REVIEW_GHA_REPO }}" | grep -qE '^[a-zA-Z0-9_-]+/[a-zA-Z0-9._-]+$'; then
+              echo "::warning::Invalid NIXPKGS_REVIEW_GHA_REPO format: ${{ env.NIXPKGS_REVIEW_GHA_REPO }}"
+              review_gha="false"
+            fi
+          fi
+
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "nixpkgs-repo=${{ env.NIXPKGS_REPO }}" >> "$GITHUB_OUTPUT"
+          echo "nixpkgs-fork=${{ env.NIXPKGS_FORK }}" >> "$GITHUB_OUTPUT"
+          echo "nixpkgs-review-gha=$review_gha" >> "$GITHUB_OUTPUT"
+          echo "nixpkgs-review-gha-repo=${{ env.NIXPKGS_REVIEW_GHA_REPO }}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: parse-inputs
+    permissions:
+      contents: read
+
+    outputs:
+      packages: ${{ steps.create-matrix.outputs.packages }}
+
+    steps:
+      - name: Create matrix
+        id: create-matrix
+        run: |
+          packages="${{ needs.parse-inputs.outputs.packages }}"
+
+          matrix_json=$(echo "$packages" | tr ' ' '\n' | jq -R -s -c '
+            split("\n") |
+            map(select(length > 0)) |
+            map({package: .})
+          ')
+
+          count=$(echo "$matrix_json" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Matrix is empty after processing packages: $packages"
+            exit 1
+          fi
+
+          echo "::notice::Created matrix with $count package(s)"
+          echo "packages=$matrix_json" >> "$GITHUB_OUTPUT"
+
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs:
+      - prepare-matrix
+      - parse-inputs
+    if: ${{ needs.prepare-matrix.outputs.packages != '' && needs.prepare-matrix.outputs.packages != '[]' && needs.prepare-matrix.outputs.packages != 'null' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: ${{ fromJson(needs.prepare-matrix.outputs.packages) }}
+
+    steps:
+      - name: Check if PR exists
+        id: check-pr
+        run: |
+          package="${{ matrix.package }}"
+
+          matches=$(gh pr list --repo "${{ needs.parse-inputs.outputs.nixpkgs-repo }}" --state open --json number,title \
+            | jq -c --arg pkg "$package" 'map(select(.title | ascii_downcase | startswith($pkg + ":")))')
+
+          count=$(echo "$matches" | jq 'length')
+          if [ "$count" -gt 0 ]; then
+            numbers=$(echo "$matches" | jq -r 'map(.number) | join(", ")')
+            echo "::warning::Skipping $package - existing PR(s): #$numbers"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Checkout nixpkgs
+        if: steps.check-pr.outputs.exists == 'false'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.parse-inputs.outputs.nixpkgs-repo }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Install Nix
+        if: steps.check-pr.outputs.exists == 'false'
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup Magic Nix Cache
+        if: steps.check-pr.outputs.exists == 'false'
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Run update script
+        if: steps.check-pr.outputs.exists == 'false'
+        id: update
+        run: |
+          package="${{ matrix.package }}"
+
+          nix-shell maintainers/scripts/update.nix \
+            -I nixpkgs=. \
+            --argstr package "$package" \
+            --argstr skip-prompt true 2>&1 || true
+
+          if git diff --quiet; then
+            echo "::notice::No update available for $package"
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+
+          old_version=$(git diff | grep -E '^\-.*version\s*=\s*"' | head -1 | sed -E 's/.*"([^"]*)".*/\1/' || \
+                        git diff | grep -E '^\-.*pversion\s*=\s*"' | head -1 | sed -E 's/.*"([^"]*)".*/\1/' || \
+                        echo "unknown")
+          new_version=$(git diff | grep -E '^\+.*version\s*=\s*"' | head -1 | sed -E 's/.*"([^"]*)".*/\1/' || \
+                        git diff | grep -E '^\+.*pversion\s*=\s*"' | head -1 | sed -E 's/.*"([^"]*)".*/\1/' || \
+                        nix eval --raw ".#$package.version" 2>/dev/null || echo "unknown")
+
+          echo "old-version=$old_version" >> "$GITHUB_OUTPUT"
+          echo "new-version=$new_version" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Updated $package: $old_version -> $new_version"
+
+      - name: Get package metadata
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        id: metadata
+        run: |
+          package="${{ matrix.package }}"
+
+          description=$(nix eval --raw ".#$package.meta.description" 2>/dev/null || echo "")
+          homepage=$(nix eval --raw ".#$package.meta.homepage" 2>/dev/null || echo "")
+          changelog=$(nix eval --raw ".#$package.meta.changelog" 2>/dev/null || echo "")
+
+          maintainers=$(nix eval --json ".#$package.meta.maintainers" 2>/dev/null | \
+            jq -r '.[] | select(.github != null) | "@" + .github' | tr '\n' ' ' | sed 's/ $//' || echo "")
+
+          echo "description=$description" >> "$GITHUB_OUTPUT"
+          echo "homepage=$homepage" >> "$GITHUB_OUTPUT"
+          echo "changelog=$changelog" >> "$GITHUB_OUTPUT"
+          echo "maintainers=$maintainers" >> "$GITHUB_OUTPUT"
+
+      - name: Run nixpkgs-review
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        id: review
+        run: |
+          package="${{ matrix.package }}"
+
+          nix run nixpkgs#nixpkgs-review -- wip --no-shell 2>&1 || true
+
+          system=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          echo "system=$system" >> "$GITHUB_OUTPUT"
+
+          store_path=$(nix-build -A "$package" --no-out-link 2>/dev/null || echo "")
+          echo "store-path=$store_path" >> "$GITHUB_OUTPUT"
+
+          new_version="${{ steps.update.outputs.new-version }}"
+          if [ -n "$store_path" ] && [ "$new_version" != "unknown" ]; then
+            if grep -r "$new_version" "$store_path" >/dev/null 2>&1; then
+              echo "version-in-output=true" >> "$GITHUB_OUTPUT"
+            fi
+            if echo "$store_path" | grep -q "$new_version"; then
+              echo "version-in-filename=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          head_hash=$(git rev-parse HEAD)
+          for review_dir in "${HOME}/.cache/nixpkgs-review/rev-${head_hash}"{,-dirty}; do
+            [ -f "$review_dir/report.json" ] && break
+          done
+          if [ -f "$review_dir/report.json" ]; then
+            built_packages=$(jq -r --arg sys "$system" '
+              .result[$sys].built // [] | map("    <li>" + . + "</li>") | join("\n")
+            ' "$review_dir/report.json")
+
+            test_packages=$(jq -r --arg sys "$system" '
+              .result[$sys].tests // [] | map("    <li>" + . + "</li>") | join("\n")
+            ' "$review_dir/report.json")
+
+            built_count=$(jq -r --arg sys "$system" '.result[$sys].built // [] | length' "$review_dir/report.json")
+            test_count=$(jq -r --arg sys "$system" '.result[$sys].tests // [] | length' "$review_dir/report.json")
+            {
+              echo "built-packages<<EOF"
+              echo "$built_packages"
+              echo "EOF"
+              echo "test-packages<<EOF"
+              echo "$test_packages"
+              echo "EOF"
+              echo "built-count=$built_count"
+              echo "test-count=$test_count"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::nixpkgs-review report.json not found"
+            echo "built-count=0" >> "$GITHUB_OUTPUT"
+            echo "test-count=0" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run passthru.tests
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        id: tests
+        run: |
+          package="${{ matrix.package }}"
+
+          if nix eval --json ".#$package.passthru.tests" 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1; then
+            echo "has-tests=true" >> "$GITHUB_OUTPUT"
+
+            tests=$(nix eval --json ".#$package.passthru.tests" 2>/dev/null | jq -r 'keys[]' || echo "")
+
+            if [ -n "$tests" ]; then
+              echo "::notice::Running passthru.tests for $package"
+
+              passed_tests=""
+              failed_tests=""
+
+              for test in $tests; do
+                echo "::notice::Running test: $test"
+                if nix build ".#$package.passthru.tests.$test" --no-link 2>&1; then
+                  passed_tests="${passed_tests}${test} "
+                else
+                  failed_tests="${failed_tests}${test} "
+                fi
+              done
+
+              echo "passed-tests=${passed_tests% }" >> "$GITHUB_OUTPUT"
+              echo "failed-tests=${failed_tests% }" >> "$GITHUB_OUTPUT"
+
+              passed_count=$(echo "$passed_tests" | wc -w | tr -d ' ')
+              failed_count=$(echo "$failed_tests" | wc -w | tr -d ' ')
+
+              echo "passed-count=$passed_count" >> "$GITHUB_OUTPUT"
+              echo "failed-count=$failed_count" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "has-tests=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No passthru.tests found for $package"
+          fi
+
+      - name: Commit and push changes
+        id: commit-push
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          fork_owner=$(echo "${{ needs.parse-inputs.outputs.nixpkgs-fork }}" | cut -d'/' -f1)
+          fork_repo=$(echo "${{ needs.parse-inputs.outputs.nixpkgs-fork }}" | cut -d'/' -f2)
+
+          if ! git remote get-url fork 2>/dev/null; then
+            git remote add fork "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${{ needs.parse-inputs.outputs.nixpkgs-fork }}.git"
+          fi
+
+          branch_name="auto-update/${{ matrix.package }}"
+          git checkout -B "$branch_name"
+
+          git add -A
+          git commit -m "${{ matrix.package }}: ${{ steps.update.outputs.old-version }} -> ${{ steps.update.outputs.new-version }}"
+
+          git push -f fork "$branch_name"
+
+          echo "branch=$branch_name" >> "$GITHUB_OUTPUT"
+          echo "head=$fork_owner:$branch_name" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Create Pull Request
+        id: create-pr
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        run: |
+          package="${{ matrix.package }}"
+          description="${{ steps.metadata.outputs.description }}"
+          homepage="${{ steps.metadata.outputs.homepage }}"
+          changelog="${{ steps.metadata.outputs.changelog }}"
+          old_version="${{ steps.update.outputs.old-version }}"
+          new_version="${{ steps.update.outputs.new-version }}"
+          system="${{ steps.review.outputs.system }}"
+          maintainers="${{ steps.metadata.outputs.maintainers }}"
+          store_path="${{ steps.review.outputs.store-path }}"
+
+          # Build passthru.tests section
+          tests_section=""
+          if [ "${{ steps.tests.outputs.has-tests }}" = "true" ]; then
+            tests_section="
+          - passthru.tests: ${{ steps.tests.outputs.passed-count }} passed, ${{ steps.tests.outputs.failed-count }} failed"
+            [ -n "${{ steps.tests.outputs.passed-tests }}" ] && tests_section="${tests_section}
+            - ✅ passed: ${{ steps.tests.outputs.passed-tests }}"
+            [ -n "${{ steps.tests.outputs.failed-tests }}" ] && tests_section="${tests_section}
+            - ❌ failed: ${{ steps.tests.outputs.failed-tests }}"
+          fi
+
+          # Build version checks section
+          version_checks=""
+          [ "${{ steps.review.outputs.version-in-output }}" = "true" ] && version_checks="${version_checks}
+          - found ${new_version} with grep in ${store_path}"
+          [ "${{ steps.review.outputs.version-in-filename }}" = "true" ] && version_checks="${version_checks}
+          - found ${new_version} in filename of file in ${store_path}"
+
+          # Build nixpkgs-review results
+          review_results=""
+          if [ "${{ steps.review.outputs.test-count }}" -gt 0 ]; then
+            plural="s"; [ "${{ steps.review.outputs.test-count }}" = "1" ] && plural=""
+            review_results="<details>
+          <summary>:white_check_mark: ${{ steps.review.outputs.test-count }} test${plural} built:</summary>
+          <ul>
+          ${{ steps.review.outputs.test-packages }}  </ul>
+          </details>
+
+          "
+          fi
+
+          if [ "${{ steps.review.outputs.built-count }}" -gt 0 ]; then
+            plural="s"; [ "${{ steps.review.outputs.built-count }}" = "1" ] && plural=""
+            review_results="${review_results}<details>
+          <summary>:white_check_mark: ${{ steps.review.outputs.built-count }} package${plural} built:</summary>
+          <ul>
+          ${{ steps.review.outputs.built-packages }}  </ul>
+          </details>
+
+          "
+          fi
+
+          [ -z "$review_results" ] && review_results=":information_source: No packages were built"
+
+          # Build maintainer ping
+          maintainer_ping=""
+          [ -n "$maintainers" ] && maintainer_ping="cc ${maintainers} for [testing](https://github.com/ryantm/nixpkgs-update/blob/main/doc/nixpkgs-maintainer-faq.md#r-ryantm-opened-a-pr-for-my-package-what-do-i-do)."
+
+          # Build PR body
+          cat > /tmp/pr-body.md <<EOF
+          Automatic update generated by [nixpkgs-update-gha](https://github.com/delafthi/nixpkgs-update-gha). This update was made based on information from \`passthru.updateScript\`.
+
+          meta.description for ${package} is: ${description}
+
+          meta.homepage for ${package} is: ${homepage}
+
+          meta.changelog for ${package} is: ${changelog}
+
+          ###### Updates performed
+
+          - Ran \`passthru.updateScript\`
+
+          ###### To inspect upstream changes
+
+          ${changelog:-$homepage}
+
+          ###### Impact
+
+          <b>Checks done</b>
+
+          ---
+
+          - built on NixOS${tests_section}${version_checks}
+
+          ---
+
+          <details>
+          <summary>
+          <b>Rebuild report</b> (if merged into master) (click to expand)
+          </summary>
+
+          \`\`\`
+          Build logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          \`\`\`
+
+          </details>
+
+          ### Pre-merge build results
+
+          We have automatically built all packages that will get rebuilt due to
+          this change.
+
+          This gives evidence on whether the upgrade will break dependent packages.
+          Note sometimes packages show up as _failed to build_ independent of the
+          change, simply because they are already broken on the target branch.
+
+          ## \`nixpkgs-review\` result
+
+          Generated using [\`nixpkgs-review\`](https://github.com/Mic92/nixpkgs-review).
+
+          Command: \`nixpkgs-review wip\`
+
+          ---
+          ### \`${system}\`
+          ${review_results}
+          ---
+
+          ###### Maintainer pings
+
+          ${maintainer_ping}
+
+          ---
+
+          Add a :+1: [reaction] to [pull requests you find important].
+
+          [reaction]: https://github.com/blog/2016-03-10-add-reactions-to-pull-requests-issues-and-comments/
+          [pull requests you find important]: https://github.com/NixOS/nixpkgs/pulls?q=is%3Aopen+sort%3Areactions-%2B1-desc
+          EOF
+
+          pr_url=$(gh pr create \
+            --repo "${{ needs.parse-inputs.outputs.nixpkgs-repo }}" \
+            --head "${{ steps.commit-push.outputs.head }}" \
+            --base master \
+            --title "${package}: ${old_version} -> ${new_version}" \
+            --body-file /tmp/pr-body.md)
+
+          pr_number=$(echo "$pr_url" | grep -oE '[0-9]+$')
+          echo "pull-request-url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "pull-request-number=$pr_number" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Created PR #$pr_number: $pr_url"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Trigger nixpkgs-review-gha
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.create-pr.outputs.pull-request-number != '' && needs.parse-inputs.outputs.nixpkgs-review-gha == 'true'
+        run: |
+          gh workflow run review.yml \
+            --repo "${{ needs.parse-inputs.outputs.nixpkgs-review-gha-repo }}" \
+            --field pr="${{ steps.create-pr.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
