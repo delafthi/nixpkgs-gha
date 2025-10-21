@@ -1,0 +1,370 @@
+name: Update Package
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: "Package to update"
+        required: true
+        type: string
+      nixpkgs-repo:
+        description: The nixpkgs repository to target (e.g., NixOS/nixpkgs)
+        required: true
+        type: string
+      nixpkgs-fork:
+        description: Your fork of nixpkgs to push changes to (falls back to NIXPKGS_FORK variable)
+        required: false
+        type: string
+        default: ""
+      skip-if-pr-exists:
+        description: Skip update if an open PR already exists for this package
+        type: boolean
+        required: false
+        default: true
+      nixpkgs-review-gha:
+        description: Trigger external nixpkgs-review-gha workflow after successful update
+        required: false
+        type: boolean
+        default: false
+      nixpkgs-review-gha-repo:
+        description: Your fork of nixpkgs-review-gha to trigger external review (e.g., "yourname/nixpkgs-review-gha")
+        required: false
+        type: string
+      nixpkgs-review-gha-workflow:
+        description: Workflow filename in nixpkgs-review-gha repo
+        required: false
+        type: string
+        default: review.yml
+
+# Prevent concurrent updates of the same package
+concurrency:
+  group: update-package-${{ inputs.package }}-${{ inputs.nixpkgs-repo }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Validate configuration
+        run: |
+          echo "::group::Validating configuration"
+
+          # Validate GH_TOKEN secret
+          if [ -z "${{ secrets.GH_TOKEN }}" ]; then
+            echo "::error::GH_TOKEN secret is required but not set"
+            echo "::error::Configure this in Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+          # Validate NIXPKGS_FORK (from input or variable)
+          fork="${{ inputs.nixpkgs-fork || vars.NIXPKGS_FORK }}"
+          if [ -z "$fork" ]; then
+            echo "::error::NIXPKGS_FORK must be provided via input or repository variable"
+            exit 1
+          fi
+          echo "NIXPKGS_FORK=$fork" >> "$GITHUB_ENV"
+
+          # Validate package name format
+          if ! echo "${{ inputs.package }}" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid package name: ${{ inputs.package }}"
+            echo "::error::Package names should contain only alphanumeric characters, hyphens, underscores, and dots"
+            exit 1
+          fi
+
+          echo "::notice::Configuration validated for package: ${{ inputs.package }}"
+          echo "::endgroup::"
+
+      - name: Check if PR exists
+        id: find-prs
+        if: ${{ inputs.skip-if-pr-exists == true }}
+        run: |
+          echo "::group::Checking for existing PRs"
+
+          # Escape package name for use in regex to match special characters literally
+          # This prevents regex injection from package names with special chars like "foo++", "bar.js"
+          pkg_escaped=$(echo "${{ inputs.package }}" | sed 's/[.[\*^$()+?{|]/\\&/g')
+
+          # Retry logic for transient API failures
+          max_attempts=3
+          attempt=0
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt + 1))
+            
+            # Query open PRs for this package
+            # Matches titles starting with package name followed by colon (e.g., "hello: 1.0 → 2.0")
+            if matches=$(gh pr list --repo ${{ inputs.nixpkgs-repo }} --state open --json number,title \
+              | jq -c --arg pkg "$pkg_escaped" 'map(select(.title | test("^" + $pkg + ":"; "i")))'); then
+              break
+            else
+              echo "::warning::PR list attempt $attempt failed, retrying..."
+              [ $attempt -lt $max_attempts ] && sleep 5
+            fi
+          done
+
+          if [ $attempt -eq $max_attempts ] && [ -z "$matches" ]; then
+            echo "::error::Failed to query PRs after $max_attempts attempts"
+            exit 1
+          fi
+
+          count=$(jq 'length' <<<"$matches")
+          if [ "$count" -gt 0 ]; then
+            numbers=$(jq -r 'map(.number)|join(", ")' <<<"$matches")
+            echo "::warning::Skipping ${{ inputs.package }} - existing PR(s): #$numbers"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No existing PRs found for ${{ inputs.package }}"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Checkout nixpkgs
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.nixpkgs-repo }}
+
+      - name: Configure Git
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        run: |
+          echo "::group::Configuring Git"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "::endgroup::"
+
+      - name: Install Nix
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup Magic Nix Cache
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Get current package information
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: current-package
+        run: |
+          echo "::group::Getting current package information"
+
+          # Get current version
+          old_version=$(nix eval --raw .#${{ inputs.package }}.version 2>/dev/null || {
+            echo "::error::Package ${{ inputs.package }} not found in nixpkgs"
+            exit 1
+          })
+          echo "old-version=$old_version" >> "$GITHUB_OUTPUT"
+          echo "::notice::Current version: $old_version"
+
+          # Get changelog URL if available (validate it's a proper URL)
+          changelog=$(nix eval --raw .#${{ inputs.package }}.meta.changelog 2>/dev/null || echo "")
+          if [ -n "$changelog" ]; then
+            # Validate it's a proper HTTP(S) URL to prevent injection
+            if echo "$changelog" | grep -qE '^https?://'; then
+              echo "changelog=$changelog" >> "$GITHUB_OUTPUT"
+              echo "::notice::Changelog available: $changelog"
+            else
+              echo "::warning::Invalid changelog URL format, ignoring: $changelog"
+              echo "changelog=" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "changelog=" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::endgroup::"
+
+      - name: Run nix-update
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: nix-update
+        run: |
+          echo "::group::Running nix-update for ${{ inputs.package }}"
+
+          if nix run nixpkgs#nix-update -- ${{ inputs.package }}; then
+            echo "::notice::nix-update completed successfully"
+            echo "::endgroup::"
+          else
+            exit_code=$?
+            echo "::endgroup::"
+            echo "::error::nix-update failed with exit code $exit_code"
+            exit 1
+          fi
+
+      - name: Get updated version
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: new-version
+        run: |
+          echo "::group::Getting updated version"
+
+          # Fail if version cannot be determined - consistent with current-package step
+          new_version=$(nix eval --raw .#${{ inputs.package }}.version 2>/dev/null || {
+            echo "::error::Failed to get updated version for ${{ inputs.package }}"
+            exit 1
+          })
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "::notice::Updated to version: $new_version"
+          echo "::endgroup::"
+
+      - name: Run nixpkgs-review
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: nixpkgs-review
+        run: |
+          echo "::group::Running nixpkgs-review"
+
+          # Get the current commit for review
+          commit=$(git rev-parse HEAD)
+          echo "::notice::Reviewing commit: $commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          # Get system architecture
+          system=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          echo "system=$system" >> "$GITHUB_OUTPUT"
+
+          # Run nixpkgs-review with GitHub token to avoid oauth warnings
+          # The report.md will be written to ~/.cache/nixpkgs-review/rev-<commit>/
+          review_failed=false
+          if nix run nixpkgs#nixpkgs-review -- rev "$commit" --no-shell 2>&1 | tee review.log; then
+            echo "::notice::nixpkgs-review completed successfully - all builds passed"
+          else
+            echo "::warning::nixpkgs-review completed with failures"
+            review_failed=true
+          fi
+
+          # Find and read the report.md file from the cache directory
+          # nixpkgs-review stores it at ~/.cache/nixpkgs-review/rev-<commit>/report.md
+          cache_dir="$HOME/.cache/nixpkgs-review/rev-$commit"
+          if [ -f "$cache_dir/report.md" ]; then
+            echo "::notice::Found report at $cache_dir/report.md"
+            {
+              echo "report<<EOF"
+              cat "$cache_dir/report.md"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::report.md not found at $cache_dir/report.md"
+            # Fallback to empty report
+            echo "report=" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Handle failures
+          if [ "$review_failed" = true ]; then
+            # Look for build failures in the log
+            failed_info=$(grep -A 3 "^error:" review.log | head -20 || echo "Build failed - see workflow logs for details")
+            {
+              echo "failed-info<<EOF"
+              echo "$failed_info"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::endgroup::"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Prepare PR body
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: pr-body
+        run: |
+          echo "::group::Preparing PR body"
+
+          {
+            echo "body<<EOF"
+            echo "Automatic update generated by [nixpkgs-update-gha](https://github.com/delafthi/nixpkgs-update-gha)."
+            echo ""
+            
+            # Add changelog if available
+            changelog="${{ steps.current-package.outputs.changelog }}"
+            if [ -n "$changelog" ]; then
+              echo "**Changelog:** $changelog"
+              echo ""
+            fi
+            
+            # Add nixpkgs-review report if available
+            # The report.md from nixpkgs-review already contains the full markdown report
+            review_report="${{ steps.nixpkgs-review.outputs.report }}"
+            if [ -n "$review_report" ]; then
+              echo "---"
+              echo ""
+              echo "$review_report"
+            else
+              # Fallback if report extraction failed
+              echo "---"
+              echo ""
+              echo "## \`nixpkgs-review\` result"
+              echo ""
+              echo "Generated using [\`nixpkgs-review\`](https://github.com/Mic92/nixpkgs-review)."
+              echo ""
+              echo "**Commit:** \`${{ steps.nixpkgs-review.outputs.commit }}\`"
+              echo "**System:** \`${{ steps.nixpkgs-review.outputs.system }}\`"
+              echo ""
+              echo "✅ Build completed successfully"
+            fi
+            
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::endgroup::"
+
+      - name: Create Pull Request
+        if: ${{ steps.find-prs.outputs.found != 'true' }}
+        id: create-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          push-to-fork: ${{ env.NIXPKGS_FORK }}
+          branch: auto-update/${{ inputs.package }}
+          delete-branch: true
+          title: "${{ inputs.package }}: ${{ steps.current-package.outputs.old-version }} → ${{ steps.new-version.outputs.version }}"
+          body: ${{ steps.pr-body.outputs.body }}
+          commit-message: "${{ inputs.package }}: ${{ steps.current-package.outputs.old-version }} → ${{ steps.new-version.outputs.version }}"
+          labels: |
+            automated-update
+            ${{ inputs.package }}
+
+      - name: Trigger nixpkgs-review-gha
+        if: ${{ steps.find-prs.outputs.found != 'true' && steps.create-pr.outputs.pull-request-number != '' && inputs.nixpkgs-review-gha == true && inputs.nixpkgs-review-gha-repo != '' }}
+        run: |
+          echo "::group::Triggering external nixpkgs-review-gha workflow"
+
+          pr_number="${{ steps.create-pr.outputs.pull-request-number }}"
+          workflow="${{ inputs.nixpkgs-review-gha-workflow }}"
+          repo="${{ inputs.nixpkgs-review-gha-repo }}"
+
+          # Retry logic for workflow trigger (transient API failures)
+          max_attempts=3
+          attempt=0
+          success=false
+
+          while [ $attempt -lt $max_attempts ] && [ "$success" = "false" ]; do
+            attempt=$((attempt + 1))
+            echo "::notice::Triggering $workflow in $repo (attempt $attempt/$max_attempts)..."
+            
+            if gh workflow run "$workflow" \
+              --repo "$repo" \
+              --field pr="$pr_number"; then
+              success=true
+              echo "::notice::Successfully triggered nixpkgs-review-gha workflow for PR #$pr_number"
+            else
+              echo "::warning::Trigger attempt $attempt failed"
+              [ $attempt -lt $max_attempts ] && sleep 5
+            fi
+          done
+
+          if [ "$success" = "false" ]; then
+            echo "::warning::Failed to trigger nixpkgs-review-gha workflow after $max_attempts attempts"
+            echo "::warning::Ensure '$workflow' exists in $repo and GH_TOKEN has workflow permissions"
+          fi
+
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
