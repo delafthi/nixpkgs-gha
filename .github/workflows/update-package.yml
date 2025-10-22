@@ -252,6 +252,15 @@ jobs:
             echo "report=" >> "$GITHUB_OUTPUT"
           fi
 
+          # Extract success status from report.json if available
+          if [ -f "$cache_dir/report.json" ]; then
+            echo "::notice::Found report.json at $cache_dir/report.json"
+            success=$(jq -r 'all(.result[]; .failed==[])' "$cache_dir/report.json" 2>/dev/null || echo "unknown")
+            echo "review-success=$success" >> "$GITHUB_OUTPUT"
+          else
+            echo "review-success=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
           # Handle failures
           if [ "$review_failed" = true ]; then
             # Look for build failures in the log
@@ -289,25 +298,33 @@ jobs:
               echo ""
             fi
             
-            # Add nixpkgs-review report if available
-            # The report.md from nixpkgs-review already contains the full markdown report
+            # Add nixpkgs-review report with enhanced formatting
+            echo "---"
+            echo ""
+            echo "## \`nixpkgs-review\` result"
+            echo ""
+            echo "Generated using [\`nixpkgs-review\`](https://github.com/Mic92/nixpkgs-review)."
+            echo ""
+            echo "**Command:** \`nixpkgs-review rev ${{ steps.nixpkgs-review.outputs.commit }}\`"
+            echo "**Commit:** [\`${{ steps.nixpkgs-review.outputs.commit }}\`](https://github.com/${{ inputs.nixpkgs-repo }}/commit/${{ steps.nixpkgs-review.outputs.commit }})"
+            echo "**System:** \`${{ steps.nixpkgs-review.outputs.system }}\`"
+            echo ""
+            echo "**Logs:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            
+            # Include the actual nixpkgs-review report if available
             review_report="${{ steps.nixpkgs-review.outputs.report }}"
             if [ -n "$review_report" ]; then
-              echo "---"
-              echo ""
               echo "$review_report"
             else
-              # Fallback if report extraction failed
-              echo "---"
+              # Fallback message if report extraction failed
+              echo "### \`${{ steps.nixpkgs-review.outputs.system }}\`"
               echo ""
-              echo "## \`nixpkgs-review\` result"
-              echo ""
-              echo "Generated using [\`nixpkgs-review\`](https://github.com/Mic92/nixpkgs-review)."
-              echo ""
-              echo "**Commit:** \`${{ steps.nixpkgs-review.outputs.commit }}\`"
-              echo "**System:** \`${{ steps.nixpkgs-review.outputs.system }}\`"
-              echo ""
-              echo "✅ Build completed successfully"
+              if [ "${{ steps.nixpkgs-review.outputs.status }}" = "success" ]; then
+                echo ":white_check_mark: All builds completed successfully"
+              else
+                echo ":x: Build failed - see workflow logs for details"
+              fi
             fi
             
             echo "EOF"
