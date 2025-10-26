@@ -4,7 +4,7 @@
 [![GitHub Actions](https://img.shields.io/badge/GitHub-Actions-blue.svg)](https://github.com/features/actions)
 
 > [!WARNING]
-> **This project is currently in testing phase.**
+> **This project is currently in a testing state.**
 >
 > Features may not work as expected and breaking changes may occur without notice. Use at your own risk.
 
@@ -30,9 +30,8 @@ Use **nixpkgs-update-gha** if you maintain packages that:
 - Release **multiple times per week** (e.g., development tools, browsers, editors)
 - Require **same-day updates** for security patches or critical bug fixes
 - Need **custom update schedules** aligned with upstream release cycles
-- Benefit from **immediate maintainer attention** on updates
 
-**Examples**: Actively developed CLI tools, IDE plugins, fast-moving frameworks, or packages you personally depend on for daily development.
+**Examples**: Actively developed CLI tools, fast-moving frameworks, or packages you personally depend on for daily development.
 
 > [!NOTE]
 > This tool **complements** rather than replaces nixpkgs-update. It gives package maintainers direct control over update timing for their specific packages while the broader ecosystem continues to benefit from the standard automation.
@@ -55,7 +54,6 @@ Use **nixpkgs-update-gha** if you maintain packages that:
 **Essential steps to get started:**
 
 1. **Fork repositories**
-   - Fork [nixpkgs](https://github.com/NixOS/nixpkgs) and note your fork name (e.g., `username/nixpkgs`)
    - Fork [this repository](https://github.com/delafthi/nixpkgs-update-gha/fork)
 
 2. **Create GitHub token**
@@ -87,24 +85,6 @@ For detailed configuration and troubleshooting, see the [Setup](#setup) section 
 - **Automatic test execution** for packages with `passthru.tests`
 - **Detailed PR reports** with build logs, version verification, and test results
 - **Manual control** for on-demand updates
-- **Multi-system support** (x86_64-linux, aarch64-linux, aarch64-darwin, x86_64-darwin)
-
-## Prerequisites
-
-- **GitHub account** with permissions to:
-  - Create and manage repositories
-  - Generate personal access tokens (classic)
-  - Enable GitHub Actions workflows
-- **nixpkgs fork** for pushing update branches ([create fork](https://github.com/NixOS/nixpkgs/fork))
-- **GitHub Actions runners** (provided by GitHub or self-hosted) for supported systems:
-  - x86_64-linux (most packages)
-  - aarch64-linux (optional, for ARM-specific packages)
-  - aarch64-darwin (optional, for macOS ARM packages)
-  - x86_64-darwin (optional, for macOS Intel packages)
-- **Basic knowledge** of:
-  - GitHub Actions workflow basics
-  - nixpkgs package structure and contribution process
-  - Nix package management (helpful but not required)
 
 ## Setup
 
@@ -121,7 +101,7 @@ Fork nixpkgs to have a repository where update branches will be pushed:
 
 ### 3. Enable GitHub Actions
 
-In your fork, go to the [Actions](../../actions) tab and enable GitHub Actions workflows.
+In your fork of nixpkgs-update-gha, go to the [Actions](../../actions) tab and enable GitHub Actions workflows.
 
 ### 4. Configure GitHub Token
 
@@ -199,7 +179,7 @@ Trigger package updates manually:
 2. Click **Run workflow**
 3. Configure inputs (optional - falls back to repository variables):
    - **Packages**: Override `PACKAGES` variable
-   - **Trigger external nixpkgs-review-gha workflow**: Enable/disable external review
+   - **Trigger external nixpkgs-review-gha workflow**: Override `NIXPKGS_REVIEW_GHA`
    - **Repository containing nixpkgs-review-gha workflow**: Override `NIXPKGS_REVIEW_GHA_REPO`
 
 ### Viewing Results
@@ -344,16 +324,6 @@ Before contributing, please:
    - **Validate**: `nix flake check` (checks all supported systems)
    - **Test workflows**: Use [act](https://github.com/nektos/act) or manual workflow runs
 4. Update documentation if you change workflow behavior
-
-### Development Setup
-
-This project uses Nix flakes with the following tools:
-
-- **treefmt-nix** for formatting (nixfmt, prettier, keep-sorted)
-- **GitHub Actions** for CI/CD across multiple systems
-- **flake-parts** for modular flake structure
-
-Supported systems: x86_64-linux, aarch64-linux, aarch64-darwin, x86_64-darwin
 
 ## License
 
