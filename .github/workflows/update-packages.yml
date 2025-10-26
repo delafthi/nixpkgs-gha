@@ -394,6 +394,14 @@ jobs:
           [ "${{ steps.review.outputs.version-in-filename }}" = "true" ] && version_checks="${version_checks}
           - found ${new_version} in filename of file in ${store_path}"
 
+          # Build nixpkgs-review-gha link section
+          review_gha_section=""
+          if [ "${{ needs.parse-inputs.outputs.nixpkgs-review-gha }}" = "true" ]; then
+            review_gha_repo="${{ needs.parse-inputs.outputs.nixpkgs-review-gha-repo }}"
+            review_gha_section="
+          - nixpkgs-review-gha triggered for multi-platform testing ([view workflow runs](https://github.com/${review_gha_repo}/actions))"
+          fi
+
           # Build nixpkgs-review results
           review_results=""
           if [ "${{ steps.review.outputs.test-count }}" -gt 0 ]; then
@@ -448,7 +456,7 @@ jobs:
 
           ---
 
-          - built on NixOS${tests_section}${version_checks}
+          - built on NixOS${tests_section}${version_checks}${review_gha_section}
 
           ---
 
