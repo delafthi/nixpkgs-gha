@@ -285,8 +285,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run passthru.tests
+      - name: Check build results
+        # Subsequent steps that create PRs should use this conditional:
+        # if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.check-build.outputs.build-success == 'true'
         if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        id: check-build
+        run: |
+          package="${{ matrix.package }}"
+          system="${{ steps.review.outputs.system }}"
+          review_dir=${{ steps.review.outputs.review-dir }}
+
+          # Validate JSON format
+          if ! jq empty "$review_dir/report.json" 2>/dev/null; then
+            echo "::error::report.json exists but contains invalid JSON"
+            exit 1
+          fi
+
+          # Check if the updated package itself failed to build
+          # Using jq for robust JSON parsing instead of grep on text output
+          if jq -e --arg sys "$system" --arg pkg "$package" \
+            '.result[$sys].failed | map(select(. == $pkg)) | length > 0' \
+            "$review_dir/report.json" >/dev/null 2>&1; then
+            echo "::error::Package $package failed to build"
+            echo "build-success=false" >> "$GITHUB_OUTPUT"
+            # Don't create PR for failed builds - subsequent steps will be skipped via conditionals
+            exit 0
+          fi
+
+          echo "build-success=true" >> "$GITHUB_OUTPUT"
+
+          # Warn about other packages that failed due to this update
+          # No need to filter out main package - we already exited if it failed
+          failed_packages=$(jq -r --arg sys "$system" '.result[$sys].failed[]' "$review_dir/report.json" 2>/dev/null || echo "")
+          if [ -n "$failed_packages" ]; then
+            echo "::warning::Other packages failed to build: $(echo "$failed_packages" | tr '\n' ' ')"
+          fi
+
+      - name: Run passthru.tests
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.check-build.outputs.build-success == 'true'
         id: tests
         run: |
           package="${{ matrix.package }}"
@@ -327,7 +363,7 @@ jobs:
 
       - name: Commit and push changes
         id: commit-push
-        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.check-build.outputs.build-success == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -354,7 +390,7 @@ jobs:
 
       - name: Create Pull Request
         id: create-pr
-        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true'
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.check-build.outputs.build-success == 'true'
         run: |
           package="${{ matrix.package }}"
           description="${{ steps.metadata.outputs.description }}"
@@ -396,7 +432,6 @@ jobs:
           # NOTE: nixpkgs-review generates report.md containing markdown-formatted build results.
           # We extract the section after the first "---" separator for inclusion in PR body.
           review_results=$(sed -n '/^---$/,/^$/p' "${{ steps.review.outputs.review-dir }}/report.md" | tail -n +2)
-
           # Build maintainer ping
           maintainer_ping=""
           [ -n "$maintainers" ] && maintainer_ping="cc ${maintainers} for [testing](https://github.com/ryantm/nixpkgs-update/blob/main/doc/nixpkgs-maintainer-faq.md#r-ryantm-opened-a-pr-for-my-package-what-do-i-do)."
@@ -481,7 +516,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
       - name: Trigger nixpkgs-review-gha
-        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.create-pr.outputs.pull-request-number != '' && needs.parse-inputs.outputs.nixpkgs-review-gha == 'true'
+        if: steps.check-pr.outputs.exists == 'false' && steps.update.outputs.has-changes == 'true' && steps.check-build.outputs.build-success == 'true' && steps.create-pr.outputs.pull-request-number != '' && needs.parse-inputs.outputs.nixpkgs-review-gha == 'true'
         run: |
           gh workflow run review.yml \
             --repo "${{ needs.parse-inputs.outputs.nixpkgs-review-gha-repo }}" \
