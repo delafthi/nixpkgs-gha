@@ -263,35 +263,25 @@ jobs:
           fi
 
           head_hash=$(git rev-parse HEAD)
-          for review_dir in "${HOME}/.cache/nixpkgs-review/rev-${head_hash}"{,-dirty}; do
-            [ -f "$review_dir/report.json" ] && break
+          review_dir=""
+          for dir in "${HOME}/.cache/nixpkgs-review/rev-${head_hash}"{,-dirty}; do
+            if [ -d "$dir" ]; then
+              review_dir="$dir"
+              break
+            fi
           done
-          if [ -f "$review_dir/report.json" ]; then
-            built_packages=$(jq -r --arg sys "$system" '
-              .result[$sys].built // [] | map("    <li>" + . + "</li>") | join("\n")
-            ' "$review_dir/report.json")
 
-            test_packages=$(jq -r --arg sys "$system" '
-              .result[$sys].tests // [] | map("    <li>" + . + "</li>") | join("\n")
-            ' "$review_dir/report.json")
-
-            built_count=$(jq -r --arg sys "$system" '.result[$sys].built // [] | length' "$review_dir/report.json")
-            test_count=$(jq -r --arg sys "$system" '.result[$sys].tests // [] | length' "$review_dir/report.json")
-            {
-              echo "built-packages<<EOF"
-              echo "$built_packages"
-              echo "EOF"
-              echo "test-packages<<EOF"
-              echo "$test_packages"
-              echo "EOF"
-              echo "built-count=$built_count"
-              echo "test-count=$test_count"
-            } >> "$GITHUB_OUTPUT"
+          if [ ! -f "$review_dir/report.md" ]; then
+            echo "::warning::nixpkgs-review directory found but report.md missing at $review_dir"
+            exit 1
+          elif [ ! -f "$review_dir/report.json" ]; then
+            echo "::warning::nixpkgs-review directory found but report.json missing at $review_dir"
+            exit 1
           else
-            echo "::warning::nixpkgs-review report.json not found"
-            echo "built-count=0" >> "$GITHUB_OUTPUT"
-            echo "test-count=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::Found nixpkgs-review results at $review_dir"
+            echo "review-dir=$review_dir" >> "$GITHUB_OUTPUT"
           fi
+
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -402,31 +392,10 @@ jobs:
           - nixpkgs-review-gha triggered for multi-platform testing ([view workflow runs](https://github.com/${review_gha_repo}/actions))"
           fi
 
-          # Build nixpkgs-review results
-          review_results=""
-          if [ "${{ steps.review.outputs.test-count }}" -gt 0 ]; then
-            plural="s"; [ "${{ steps.review.outputs.test-count }}" = "1" ] && plural=""
-            review_results="<details>
-          <summary>:white_check_mark: ${{ steps.review.outputs.test-count }} test${plural} built:</summary>
-          <ul>
-          ${{ steps.review.outputs.test-packages }}  </ul>
-          </details>
-
-          "
-          fi
-
-          if [ "${{ steps.review.outputs.built-count }}" -gt 0 ]; then
-            plural="s"; [ "${{ steps.review.outputs.built-count }}" = "1" ] && plural=""
-            review_results="${review_results}<details>
-          <summary>:white_check_mark: ${{ steps.review.outputs.built-count }} package${plural} built:</summary>
-          <ul>
-          ${{ steps.review.outputs.built-packages }}  </ul>
-          </details>
-
-          "
-          fi
-
-          [ -z "$review_results" ] && review_results=":information_source: No packages were built"
+          # Build nixpkgs-review section
+          # NOTE: nixpkgs-review generates report.md containing markdown-formatted build results.
+          # We extract the section after the first "---" separator for inclusion in PR body.
+          review_results=$(sed -n '/^---$/,/^$/p' "${{ steps.review.outputs.review-dir }}/report.md" | tail -n +2)
 
           # Build maintainer ping
           maintainer_ping=""
@@ -482,14 +451,7 @@ jobs:
 
           ## \`nixpkgs-review\` result
 
-          Generated using [\`nixpkgs-review\`](https://github.com/Mic92/nixpkgs-review).
-
-          Command: \`nixpkgs-review wip\`
-
-          ---
-          ### \`${system}\`
           ${review_results}
-          ---
 
           ###### Maintainer pings
 
