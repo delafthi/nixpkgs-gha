@@ -156,7 +156,7 @@ jobs:
         run: |
           package="${{ matrix.package }}"
 
-          matches=$(gh pr list --repo "${{ needs.parse-inputs.outputs.nixpkgs-repo }}" --state open --json number,title \
+          matches=$(gh pr list --repo "${{ needs.parse-inputs.outputs.nixpkgs-repo }}" --state open --json number,title --limit 1000 \
             | jq -c --arg pkg "$package" 'map(select(.title | ascii_downcase | startswith($pkg + ":")))')
 
           count=$(echo "$matches" | jq 'length')
